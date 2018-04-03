@@ -1,0 +1,295 @@
+# Define the stages, the you want to use in your deployment.
+# Each stage defined needs at least on task.
+stages:
+  - test
+  - build
+  - deploy
+  - warmup
+
+# We define some global variables.
+variables:
+  # Tell GitLab which strategy should be used. See https://docs.gitlab.com/ee/ci/yaml/#git-strategy
+  GIT_STRATEGY: clone
+  # To speed to repository cloning, just get the last 10 commits. Extend this value if your repository is highly frequented.
+  GIT_DEPTH: 10
+  # Set path to composer cache dir. The /cache directory is defined as a volume in our GitLab runner configuration.
+  COMPOSER_CACHE_DIR: /cache/composer
+  # Set path to npm cache dir
+  npm_config_cache: /cache/
+  # All composer to run as superuser (root). If not set, there will be warnings during running composer commands.
+  COMPOSER_ALLOW_SUPERUSER: 1
+  # Set composer mode to non interative.
+  COMPOSER_NO_INTERACTION: 1
+
+# Each task will use only offical docker images. Of course you can create your own images to avoid installing
+# additional software and to speed up the task.
+
+# We define an "abstract" task that can be used to install composer. Make it available with the name "composer".
+.install-composer: &composer
+  image: php:7.1-cli
+  before_script:
+    - apt-get update -qq && apt-get install -qqy unzip git-core
+
+    # Install composer
+    - curl -OLs https://composer.github.io/installer.sig
+    - php -r "copy('https://getcomposer.org/installer', 'composer-setup.php');"
+    - php -r "if (hash_file('SHA384', 'composer-setup.php') === trim(file_get_contents('installer.sig'))) { echo 'Installer verified'; } else { echo 'Installer corrupt'; unlink('composer-setup.php'); } echo PHP_EOL;"
+    - php composer-setup.php --no-ansi --install-dir=/usr/bin --filename=composer
+    - php -r "unlink('composer-setup.php'); unlink('installer.sig');"
+
+# Abstract task to run composer install. This will be used during the build stage.
+# This task inherits from "composer" and will be available with the name "build".
+.build-composer: &build
+  <<: *composer
+  stage: build
+  script:
+    # The package hirak/prestissimo allows composer to install dependencies in parallel mode.
+    # This speeds up the task.
+    - composer global require hirak/prestissimo
+    # There will be a variable for each environment (e.g. ENV_STAGING, ENV_PRODUCTION) that contains .env config.
+    # An .env file will be written here based on the environment.
+    - MY_VAR=$(echo $CI_ENVIRONMENT_NAME | awk '{print toupper($0)}')_ENV; echo "${!MY_VAR}" >> .env
+    # Install composer - nothing special here :)
+    - composer install --no-dev --optimize-autoloader
+  artifacts:
+    # Because the artifact might be some megabytes, it should be deleted after 48 hours to keep the server clean.
+    expire_in: 48h
+    paths:
+      # This are the files and folders that should be used for artifact building.
+      - .env
+      # This folder contains our environment specific configuration for TYPO3.
+      # It gets included via AddtionalConfiguration.php
+      - config/
+      # Our document root. You may use Web instead ;)
+      - http/
+      # Here we put our sitepackage and other local extensions. It gets included via composer path definition.
+      - packages/
+      # Self explanatory ^
+      - vendor/
+
+# Starting with the tasks that run in the test stage. This tasks will run for every branch.
+
+# Linting task for scss. Currently we use scss_lint which is based on ruby.
+test:lint:scss:
+  image: ruby
+  stage: test
+  before_script:
+    - gem install scss_lint
+  script:
+    - scss-lint --config .scss-lint.yml
+
+# Linting task for PHP. Because this TYPO3 installation will be only run on one PHP version,
+# we must only check for this one.
+test:lint:php:
+  image: php:7.1-cli
+  stage: test
+  script:
+    - find ./packages/ -name \*.php -exec php -d display_errors=stderr -l {} > /dev/null \;
+
+# Test the codestyle for our own code. This tasks inherit from the compsoer task.
+test:codestyle:
+  <<: *composer
+  stage: test
+  script:
+    # Install friendsofphp/php-cs-fixer and hirak/prestissimo
+    - composer global require friendsofphp/php-cs-fixer hirak/prestissimo
+    # Export the global composer bin directory into PATH variable to make binary accessible without using abs. path
+    - export PATH="$PATH:$HOME/.composer/vendor/bin"
+    # Run php-cs-fixer
+    - php-cs-fixer fix --dry-run --diff --diff-format=udiff
+
+# You might add unit our functional tests here.
+
+# Task for the build stage. This tasks will only run for configured stages.
+
+# Run the composer install for staging environment.
+# We need two separate tasks for the composer install because we have different .env files.
+build:composer:staging:
+  <<: *build
+  only:
+    - master
+  environment:
+    name: staging
+
+# Run the composer install for production environment.
+build:composer:production:
+  <<: *build
+  only:
+    - production
+  environment:
+    name: production
+
+# Install the npm modules and run our gulp pipeline to compile scss and minify and uglify the JavaScript.
+# In TYPO3 we will not use compress and concatination for JavaScript and CSS.
+# This should run for staging and production builds.
+build:npm:
+  image: node:8.4
+  stage: build
+  only:
+    - master
+    - production
+  before_script:
+    - npm install -g gulp-cli --quiet
+  script:
+    - npm install --quiet
+    - npm run build
+  artifacts:
+    expire_in: 48h
+    paths:
+      - packages/my_package/Resources/Public/dist/
+
+# Copy static staging files to the final locations.
+build:static:staging:
+  image: debian
+  stage: build
+  only:
+    - master
+  script:
+    - cp environments/staging/.htaccess http/
+    - cp environments/staging/robots.txt http/
+    - cp environments/staging/Env.typoscript packages/my_package/Configuration/TypoScript/Constants/
+  artifacts:
+    untracked: true
+    expire_in: 1h
+    paths:
+      - http/
+      - environments/staging/
+      - .rsyncignore
+
+# Copy static production files to the final locations.
+build:static:production:
+  image: debian
+  stage: build
+  only:
+    - production
+  script:
+    - cp environments/production/.htaccess http/
+    - cp environments/production/robots.txt http/
+    - cp environments/production/Env.typoscript packages/my_package/Configuration/TypoScript/Constants/
+  artifacts:
+    untracked: true
+    expire_in: 1h
+    paths:
+      - http/
+      - environments/production/
+      - .rsyncignore
+
+# Task for the deploy stage.
+
+# Deploy to staging environment.
+# This task need the following variables to be defined in GitLab:
+# - STAGING_SSH_KEY
+# - STAGING_SSH_USER
+# - STAGING_SSH_HOST
+# - STAGING_BASE_DIR (without trailing /)
+deploy:staging:
+  image: debian
+  stage: deploy
+  environment:
+    name: staging
+    url: https://staging.example.tld/
+  only:
+    - master
+  variables:
+    # We dont want to clone the repository again because every file needed should be delivered by the artifacts.
+    GIT_STRATEGY: none
+  # We will add a private key for SSH key authentication to the system.
+  # The key is stored inside $STAGING_SSH_KEY variable.
+  before_script:
+    - apt-get update && apt-get install rsync -y
+    - 'which ssh-agent || ( apt-get update -y && apt-get install openssh-client -y )'
+    - eval $(ssh-agent -s)
+    - ssh-add <(echo "$STAGING_SSH_KEY")
+    - mkdir -p ~/.ssh
+    - '[[ -f /.dockerenv ]] && echo -e "Host *\n\tStrictHostKeyChecking no\n\n" > ~/.ssh/config'
+  script:
+    # We outsource the deployment steps into a separate file.
+    - environments/staging/deploy.sh
+    # After deploying to staging, we just call the rootpage that is defined in the environment above.
+    - ssh ${STAGING_SSH_USER}@${STAGING_SSH_HOST} "curl ${CI_ENVIRONMENT_URL} >/dev/null 2>&1"
+  dependencies:
+    # We define the dependencies for that task. The artifact from each dependency will be published in this task.
+    - build:composer:staging
+    - build:npm
+    - build:static:staging
+
+# Deploy to production environment.
+# This task need the following variables to be defined in GitLab:
+# - PRODUCTION_SSH_KEY
+# - PRODUCTION_SSH_USER
+# - PRODUCTION_SSH_HOST
+# - PRODUCTION_BASE_DIR (without trailing /)
+deploy:production:
+  image: debian
+  stage: deploy
+  environment:
+    name: production
+    url: https://www.example.tld/
+  only:
+    - production
+  variables:
+    # We dont want to clone the repository again because every file needed should be delivered by the artifacts.
+    GIT_STRATEGY: none
+  # We will add a private key for SSH key authentication to the system.
+  # The key is stored inside $PRODUCTION_SSH_KEY variable.
+  before_script:
+    - apt-get update && apt-get install rsync -y
+    - 'which ssh-agent || ( apt-get update -y && apt-get install openssh-client -y )'
+    - eval $(ssh-agent -s)
+    - ssh-add <(echo "$PRODUCTION_SSH_KEY")
+    - mkdir -p ~/.ssh
+    - '[[ -f /.dockerenv ]] && echo -e "Host *\n\tStrictHostKeyChecking no\n\n" > ~/.ssh/config'
+  script:
+    # We outsource the deployment steps into a separate file.
+    - environments/production/deploy.sh
+  dependencies:
+    # We define the dependencies for that task. The artifact from each dependency will be published in this task.
+    - build:composer:production
+    - build:npm
+    - build:static:production
+
+# Task for the warmup stage.
+
+# This task will crawl every TYPO3 page from pages table that is published in the xml sitemap.
+warmup:pages:production:
+  image: debian
+  stage: warmup
+  environment:
+    name: production
+  only:
+    - production
+  variables:
+    # We dont want to clone the repository again because every file needed should be delivered by the artifacts.
+    GIT_STRATEGY: none
+  before_script:
+    - apt-get update && apt-get install wget -y
+  script:
+    # We crawl every link found in the xml sitemap (https://www.example.tld/sitemap-pages/)
+    # The output get written to /dev/null
+    - wget --quiet "https://www.example.tld/sitemap-pages/" --output-document - | egrep -o "https://[^<]+" | wget --output-document /dev/null --no-verbose --user-agent "example-crawler" --random-wait -i -
+    # For news list pages, that have a pagination widget, we crawl every paginated page.
+    # In this example, the paginated pages will have a path segment named "/page/" in the url.
+    # This crawl will only look on page https://www.example.tld/aktuelles/ for paginated items.
+    - wget -r --output-document /tmp/crawl --no-parent --accept-regex ".*/page/.*" --follow-tags "a" --no-verbose --user-agent "example-crawler" --random-wait https://www.example.tld/aktuelles/
+  dependencies:
+    - deploy:production
+
+# This task will crawl every news that is published in the xml sitemap.
+warmup:news:production:
+  image: debian
+  stage: warmup
+  environment:
+    name: production
+  only:
+    - production
+  variables:
+    # We dont want to clone the repository again because every file needed should be delivered by the artifacts.
+    GIT_STRATEGY: none
+  before_script:
+    - apt-get update && apt-get install wget -y
+  script:
+    # We crawl every link found in the xml sitemap (https://www.example.tld/sitemap-news/)
+    # The output get written to /dev/null
+    - wget --quiet "https://www.exmaple.tld/sitemap-news/" --output-document - | egrep -o "https://[^<]+" | wget --output-document /dev/null --no-verbose --user-agent "example-crawler" --random-wait -i -
+  dependencies:
+    - deploy:production

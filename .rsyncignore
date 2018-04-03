@@ -1,0 +1,10 @@
+.rsyncignore
+
+environments/
+
+http/fileadmin
+
+http/typo3conf/ENABLE_INSTALL_TOOL
+
+packages/my_package/Resources/Private/scss/
+packages/my_package/Resources/Public/js/

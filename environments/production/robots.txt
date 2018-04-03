@@ -1,0 +1,2 @@
+Sitemap: https://www.example.tld/sitemap-pages/
+Sitemap: https://www.example.tld/sitemap-news/
