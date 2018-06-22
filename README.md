@@ -1,5 +1,7 @@
 # TYPO3 deployment script for GitLab CI
 
+**For a newer version, see https://github.com/codemonkey1988/t3cb18-demo**
+
 This is an example script for our GitLab deployment.
 
 This script is based on our companys TYPO3 distribution. 
